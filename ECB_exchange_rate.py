@@ -658,7 +658,7 @@ else:
                     fname_parts.append(f"FX_{fx_start}_to_{fx_end}")
                 if include_wb and selected_indicators:
                     fname_parts.append(f"WB_{int(wb_start_year)}-{int(wb_end_year)}")
-                filename = "_".join(fname_parts) + ".xlsx"
+                filename = "Ancillary Data - " +  "_".join(fname_parts) + ".xlsx"
 
                 with open(tmp.name, "rb") as f:
                     st.download_button(
