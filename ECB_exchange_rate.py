@@ -1,16 +1,18 @@
 import streamlit as st
 import requests
 import pandas as pd
-from io import StringIO
+from io import StringIO, BytesIO
+from itertools import combinations
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment
 import tempfile
 import time
+import zipfile
 from decimal import Decimal, ROUND_HALF_UP
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Global Data Downloader",
+    page_title="Ancillary data downloader",
     page_icon="🌐",
     layout="centered",
 )
@@ -21,7 +23,6 @@ st.markdown("""
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;600&display=swap');
 
     html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
-
     .stApp { background-color: #f8f9fb; color: #1a1d23; }
 
     .app-header {
@@ -49,7 +50,6 @@ st.markdown("""
         color: #1a3a6b;
         margin-bottom: 0.9rem;
     }
-
     .warn-banner {
         background: #fff8e6;
         border: 1px solid #f5d580;
@@ -60,7 +60,6 @@ st.markdown("""
         color: #7a5000;
         margin-top: 0.4rem;
     }
-
     .stButton > button {
         background: #003366 !important;
         color: #fff !important;
@@ -73,7 +72,6 @@ st.markdown("""
         font-size: 0.98rem !important;
     }
     .stButton > button:hover { background: #0055a4 !important; }
-
     .stDownloadButton > button {
         background: #1a7f37 !important;
         color: #fff !important;
@@ -83,9 +81,7 @@ st.markdown("""
         border-radius: 7px !important;
         width: 100% !important;
     }
-
     .stCheckbox label { font-size: 0.94rem; color: #2d3748; }
-
     div[data-testid="stExpander"] {
         background: #ffffff !important;
         border: 1px solid #e2e6ed !important;
@@ -93,18 +89,59 @@ st.markdown("""
         box-shadow: 0 1px 3px rgba(0,0,0,0.05);
         margin-bottom: 0.8rem;
     }
-
     hr { border-color: #e2e6ed !important; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
+# ── CURRENCY CATALOGUE ────────────────────────────────────────────────────────
+# All currencies available from ECB SDW (quoted against EUR)
+# Format: code → (full name, region/flag hint)
+CURRENCY_CATALOGUE: dict[str, str] = {
+    "EUR": "Euro",
+    "USD": "US Dollar",
+    "GBP": "British Pound",
+    "JPY": "Japanese Yen",
+    "CHF": "Swiss Franc",
+    "CAD": "Canadian Dollar",
+    "AUD": "Australian Dollar",
+    "NZD": "New Zealand Dollar",
+    "NOK": "Norwegian Krone",
+    "SEK": "Swedish Krona",
+    "DKK": "Danish Krone",
+    "SGD": "Singapore Dollar",
+    "HKD": "Hong Kong Dollar",
+    "CNY": "Chinese Yuan",
+    "KRW": "South Korean Won",
+    "INR": "Indian Rupee",
+    "BRL": "Brazilian Real",
+    "MXN": "Mexican Peso",
+    "ZAR": "South African Rand",
+    "TRY": "Turkish Lira",
+    "PLN": "Polish Zloty",
+    "CZK": "Czech Koruna",
+    "HUF": "Hungarian Forint",
+    "RON": "Romanian Leu",
+    "BGN": "Bulgarian Lev",
+    "HRK": "Croatian Kuna",
+    "RUB": "Russian Ruble",
+    "IDR": "Indonesian Rupiah",
+    "MYR": "Malaysian Ringgit",
+    "PHP": "Philippine Peso",
+    "THB": "Thai Baht",
+    "ILS": "Israeli Shekel",
+}
+
+# Currency options for the multiselect: "USD — US Dollar"
+CURRENCY_OPTIONS = [f"{code} — {name}" for code, name in CURRENCY_CATALOGUE.items()]
+DEFAULT_CURRENCIES = ["USD — US Dollar", "GBP — British Pound", "JPY — Japanese Yen", "CHF — Swiss Franc"]
+
+
+# ── WORLD BANK CONSTANTS ──────────────────────────────────────────────────────
 WORLD_BANK_BASE = "https://api.worldbank.org/v2"
 HEADER_COLOR    = "003366"
 ALTERNATE_ROW   = "EEF3FA"
 
-# 20 indicators in 6 themed groups
 WB_INDICATOR_GROUPS: dict[str, dict[str, str]] = {
     "📈 Growth & Output": {
         "GDP growth (annual %)":           "NY.GDP.MKTP.KD.ZG",
@@ -140,7 +177,6 @@ WB_INDICATOR_GROUPS: dict[str, dict[str, str]] = {
     },
 }
 
-# Flat label → code lookup
 WB_INDICATORS: dict[str, str] = {
     label: code
     for grp in WB_INDICATOR_GROUPS.values()
@@ -148,32 +184,32 @@ WB_INDICATORS: dict[str, str] = {
 }
 
 WB_INDICATOR_NOTES: dict[str, str] = {
-    "NY.GDP.MKTP.KD.ZG":   "Constant 2015 USD. Annual % change.",
-    "NY.GDP.MKTP.KD":      "Constant 2015 USD. Not inflation-adjusted.",
-    "NY.GDP.PCAP.KD":      "Constant 2015 USD per capita.",
-    "NY.GDP.DEFL.KD.ZG":   "Annual % change in implicit price deflator.",
-    "SP.POP.TOTL":         "De facto population, mid-year estimates.",
-    "SP.POP.GROW":         "Annual population growth rate (%).",
-    "SL.UEM.TOTL.ZS":      "ILO modelled estimates. % of total labour force.",
-    "SL.TLF.TOTL.IN":      "Total labour force (persons).",
-    "SL.TLF.CACT.ZS":      "Labour force as % of population ages 15+.",
-    "SL.GDP.PCAP.EM.KD":   "Constant 1990 PPP USD per employed person.",
-    "FP.CPI.TOTL.ZG":      "Consumer price index, annual % change.",
-    "NE.GDI.TOTL.ZS":      "Gross capital formation as % of GDP.",
-    "NY.GNS.ICTR.ZS":      "Gross savings as % of GDP.",
-    "BN.CAB.XOKA.GD.ZS":   "Current account balance as % of GDP.",
-    "NE.EXP.GNFS.ZS":      "Exports of goods and services as % of GDP.",
-    "NE.IMP.GNFS.ZS":      "Imports of goods and services as % of GDP.",
-    "BX.KLT.DINV.WD.GD.ZS":"FDI net inflows as % of GDP.",
-    "GC.DOD.TOTL.GD.ZS":   "Central + sub-national govt debt as % of GDP.",
-    "GC.REV.XGRT.GD.ZS":   "General government revenue as % of GDP.",
-    "GC.XPN.TOTL.GD.ZS":   "General government expenditure as % of GDP.",
+    "NY.GDP.MKTP.KD.ZG":    "Constant 2015 USD. Annual % change.",
+    "NY.GDP.MKTP.KD":       "Constant 2015 USD. Not inflation-adjusted.",
+    "NY.GDP.PCAP.KD":       "Constant 2015 USD per capita.",
+    "NY.GDP.DEFL.KD.ZG":    "Annual % change in implicit price deflator.",
+    "SP.POP.TOTL":          "De facto population, mid-year estimates.",
+    "SP.POP.GROW":          "Annual population growth rate (%).",
+    "SL.UEM.TOTL.ZS":       "ILO modelled estimates. % of total labour force.",
+    "SL.TLF.TOTL.IN":       "Total labour force (persons).",
+    "SL.TLF.CACT.ZS":       "Labour force as % of population ages 15+.",
+    "SL.GDP.PCAP.EM.KD":    "Constant 1990 PPP USD per employed person.",
+    "FP.CPI.TOTL.ZG":       "Consumer price index, annual % change.",
+    "NE.GDI.TOTL.ZS":       "Gross capital formation as % of GDP.",
+    "NY.GNS.ICTR.ZS":       "Gross savings as % of GDP.",
+    "BN.CAB.XOKA.GD.ZS":    "Current account balance as % of GDP.",
+    "NE.EXP.GNFS.ZS":       "Exports of goods and services as % of GDP.",
+    "NE.IMP.GNFS.ZS":       "Imports of goods and services as % of GDP.",
+    "BX.KLT.DINV.WD.GD.ZS": "FDI net inflows as % of GDP.",
+    "GC.DOD.TOTL.GD.ZS":    "Central + sub-national govt debt as % of GDP.",
+    "GC.REV.XGRT.GD.ZS":    "General government revenue as % of GDP.",
+    "GC.XPN.TOTL.GD.ZS":    "General government expenditure as % of GDP.",
 }
 
 ECB_SOURCE = {
     "source_name": "European Central Bank (ECB)",
     "source_url":  "https://data-api.ecb.europa.eu/service/data/EXR/",
-    "notes":       "Statistical Data Warehouse — EXR series. Business days (Mon–Fri) only.",
+    "notes":       "Statistical Data Warehouse — EXR series. Business days (Mon–Fri) only. Cross rates derived via EUR.",
 }
 
 
@@ -207,7 +243,212 @@ def set_widths(ws, widths: dict):
         ws.column_dimensions[col].width = w
 
 
-# ── WORLD BANK FETCHER (paginated + exponential back-off retry) ───────────────
+def col_letter(n: int) -> str:
+    """1-based column index → Excel letter (1→A, 27→AA)."""
+    result = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        result = chr(65 + rem) + result
+    return result
+
+
+# ── ECB FETCHER ───────────────────────────────────────────────────────────────
+def fetch_ecb_vs_eur(
+    currencies: list[str],
+    start_date,
+    end_date,
+    frequency: str = "D",   # "D" daily | "M" monthly
+) -> pd.DataFrame:
+    """
+    Fetch all selected currencies against EUR in ONE API call.
+    ECB URL: EXR/{freq}.{CUR1}+{CUR2}+...EUR.SP00.A
+
+    Returns a wide DataFrame indexed by date/period with one column per currency
+    (values = units of that currency per 1 EUR).
+    EUR itself is added as a constant 1.0 column so cross rates work uniformly.
+    """
+    cur_str = "+".join(currencies)
+    url = f"https://data-api.ecb.europa.eu/service/data/EXR/{frequency}.{cur_str}.EUR.SP00.A"
+
+    if frequency == "D":
+        params = {
+            "startPeriod": start_date.strftime("%Y-%m-%d"),
+            "endPeriod":   end_date.strftime("%Y-%m-%d"),
+            "format":      "csvdata",
+        }
+        date_col = "Date"
+    else:  # M
+        params = {
+            "startPeriod": start_date.strftime("%Y-%m"),
+            "endPeriod":   end_date.strftime("%Y-%m"),
+            "format":      "csvdata",
+        }
+        date_col = "Month"
+
+    raw  = pd.read_csv(StringIO(requests.get(url, params=params, timeout=30).text))
+    # ECB CSV has CURRENCY and TIME_PERIOD columns
+    df   = raw[["CURRENCY", "TIME_PERIOD", "OBS_VALUE"]].copy()
+    df.columns = ["Currency", date_col, "Rate"]
+    df["Rate"] = pd.to_numeric(df["Rate"], errors="coerce")
+    df = df.dropna()
+
+    # Pivot to wide: rows = date, columns = currency code
+    wide = df.pivot(index=date_col, columns="Currency", values="Rate")
+    wide.index.name = date_col
+
+    # Add EUR = 1.0 so EUR/XXX cross rates work without special-casing
+    wide["EUR"] = 1.0
+
+    # Keep only requested currencies (+ EUR) in consistent order
+    keep = ["EUR"] + [c for c in currencies if c in wide.columns]
+    wide = wide[keep].sort_index()
+    return wide
+
+
+def compute_pairs(
+    wide: pd.DataFrame,
+    pairs: list[tuple[str, str]],
+) -> pd.DataFrame:
+    """
+    Given a wide DataFrame of currency/EUR rates, compute requested pairs.
+    pair (BASE, QUOTE) → rate = how many QUOTE per 1 BASE
+      = (QUOTE_per_EUR) / (BASE_per_EUR)
+
+    Returns a DataFrame with one column per pair named "BASE/QUOTE".
+    """
+    result = pd.DataFrame(index=wide.index)
+    for base, quote in pairs:
+        col_name = f"{base}/{quote}"
+        if base in wide.columns and quote in wide.columns:
+            result[col_name] = (wide[quote] / wide[base]).apply(precise_round)
+        else:
+            result[col_name] = float("nan")
+    return result
+
+
+def make_pair(base: str, quote: str) -> list[tuple[str, str]]:
+    """Return the single (base, quote) pair as a list for compatibility with compute_pairs."""
+    return [(base, quote)]
+
+
+# ── EXCEL BUILDERS ────────────────────────────────────────────────────────────
+def build_fx_sheets(wb: Workbook, base: str, quote: str, start_date, end_date):
+    """
+    Build 4 FX sheets (Annual, Monthly, Weekly, Daily) for one currency pair.
+    Columns per sheet: date info | BASE/QUOTE | QUOTE/BASE
+    Uses 2 ECB API calls (daily + monthly).
+    """
+    # Currencies needed — if one is EUR we only need the other; ECB always quotes vs EUR
+    non_eur = [c for c in [base, quote] if c != "EUR"]
+    wide_d = fetch_ecb_vs_eur(non_eur, start_date, end_date, frequency="D")
+    wide_m = fetch_ecb_vs_eur(non_eur, start_date, end_date, frequency="M")
+
+    fwd_col  = f"{base}/{quote}"       # e.g. USD/EUR
+    inv_col  = f"{quote}/{base}"       # e.g. EUR/USD
+
+    def _add_both(wide):
+        """Return df with forward and inverse rate columns, vectorised."""
+        b = wide[base].values   # numpy array — no ambiguity
+        q = wide[quote].values
+        df = pd.DataFrame(index=wide.index)
+        df[fwd_col] = pd.Series(q / b, index=wide.index).apply(precise_round)
+        df[inv_col] = pd.Series(b / q, index=wide.index).apply(precise_round)
+        return df
+
+    # ── Daily ────────────────────────────────────────────────────────────────
+    ws_d = wb.active
+    ws_d.title = "ECB - FX - Daily"
+    pairs_d = _add_both(wide_d)
+    headers_d = ["Date", fwd_col, inv_col]
+    write_headers(ws_d, headers_d)
+    set_widths(ws_d, {"A": 14, "B": 16, "C": 16})
+    for i, (date, row) in enumerate(pairs_d.iterrows()):
+        r = i + 2
+        ws_d.cell(r, 1, date)
+        ws_d.cell(r, 2, row[fwd_col])
+        ws_d.cell(r, 3, row[inv_col])
+        style_row(ws_d, r, 3, i % 2 == 0)
+
+    # ── Weekly ───────────────────────────────────────────────────────────────
+    ws_w = wb.create_sheet("ECB - FX - Weekly")
+    daily_df = wide_d.copy()
+    daily_df.index = pd.to_datetime(daily_df.index)
+    daily_df["ISOYear"] = daily_df.index.isocalendar().year.astype(int)
+    daily_df["ISOWeek"] = daily_df.index.isocalendar().week.astype(int)
+    cols_to_avg = list(set([c for c in [base, quote, "EUR"] if c in daily_df.columns]))
+
+    # Keep ISOYear/ISOWeek as the MultiIndex — avoids column name collisions
+    wide_w = (
+        daily_df
+        .groupby(["ISOYear", "ISOWeek"])[cols_to_avg]
+        .mean()
+    )  # index = (ISOYear, ISOWeek), no reset_index
+
+    def _monday(iso_year, iso_week):
+        return pd.to_datetime(
+            f"{iso_year}-W{iso_week:02d}-1", format="%G-W%V-%u"
+        ).strftime("%Y-%m-%d")
+
+    def _friday(iso_year, iso_week):
+        return (
+            pd.to_datetime(f"{iso_year}-W{iso_week:02d}-1", format="%G-W%V-%u")
+            + pd.Timedelta(days=4)
+        ).strftime("%Y-%m-%d")
+
+    headers_w = ["Year", "Week #", "Week Start (Mon)", "Week End (Fri)", fwd_col, inv_col]
+    write_headers(ws_w, headers_w)
+    set_widths(ws_w, {"A": 8, "B": 8, "C": 18, "D": 18, "E": 16, "F": 16})
+
+    for i, ((iso_year, iso_week), wrow) in enumerate(wide_w.iterrows()):
+        r = i + 2
+        # wrow is now a plain Series with only currency columns — safe scalar access
+        b_val = float(wrow[base])
+        q_val = float(wrow[quote])
+        ws_w.cell(r, 1, int(iso_year))
+        ws_w.cell(r, 2, int(iso_week))
+        ws_w.cell(r, 3, _monday(iso_year, iso_week))
+        ws_w.cell(r, 4, _friday(iso_year, iso_week))
+        ws_w.cell(r, 5, precise_round(q_val / b_val))
+        ws_w.cell(r, 6, precise_round(b_val / q_val))
+        style_row(ws_w, r, 6, i % 2 == 0)
+
+    # ── Monthly ──────────────────────────────────────────────────────────────
+    ws_m = wb.create_sheet("ECB - FX - Monthly")
+    pairs_m   = _add_both(wide_m)
+    month_idx = wide_m.index.tolist()
+    headers_m = ["Month", "Year", "Month Name", fwd_col, inv_col]
+    write_headers(ws_m, headers_m)
+    set_widths(ws_m, {"A": 12, "B": 8, "C": 14, "D": 16, "E": 16})
+    for i, month in enumerate(month_idx):
+        r = i + 2
+        ws_m.cell(r, 1, month)
+        ws_m.cell(r, 2, month[:4])
+        ws_m.cell(r, 3, pd.to_datetime(month).strftime("%B"))
+        ws_m.cell(r, 4, pairs_m[fwd_col].iloc[i])
+        ws_m.cell(r, 5, pairs_m[inv_col].iloc[i])
+        style_row(ws_m, r, 5, i % 2 == 0)
+
+    # ── Annual ───────────────────────────────────────────────────────────────
+    ws_a = wb.create_sheet("ECB - FX - Annual")
+    daily_df2 = wide_d.copy()
+    daily_df2.index = pd.to_datetime(daily_df2.index)
+    # Group by year — index = year integer, columns = only currency cols
+    wide_a = daily_df2.groupby(daily_df2.index.year)[cols_to_avg].mean()
+    headers_a = ["Year", f"Avg {fwd_col}", f"Avg {inv_col}"]
+    write_headers(ws_a, headers_a)
+    set_widths(ws_a, {"A": 10, "B": 18, "C": 18})
+    for i, (year, arow) in enumerate(wide_a.iterrows()):
+        r = i + 2
+        # arow is a plain Series with only currency columns — safe scalar access
+        b_val = float(arow[base])
+        q_val = float(arow[quote])
+        ws_a.cell(r, 1, int(year))
+        ws_a.cell(r, 2, precise_round(q_val / b_val))
+        ws_a.cell(r, 3, precise_round(b_val / q_val))
+        style_row(ws_a, r, 3, i % 2 == 0)
+
+
+# ── WORLD BANK FETCHER ────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_wb_indicator(
     indicator_code: str,
@@ -216,10 +457,6 @@ def fetch_wb_indicator(
     end_year: int,
     max_retries: int = 4,
 ) -> pd.DataFrame:
-    """
-    Fetches a WB indicator with full pagination and retry on 5xx / timeout.
-    countries = tuple of ISO-2 codes, or ("all",) for every individual country.
-    """
     fetch_all   = list(countries) == ["all"]
     country_str = "all" if fetch_all else ";".join(countries)
     url         = f"{WORLD_BANK_BASE}/country/{country_str}/indicator/{indicator_code}"
@@ -244,7 +481,7 @@ def fetch_wb_indicator(
                 break
             except (requests.RequestException, requests.HTTPError) as exc:
                 last_exc = exc
-                time.sleep(2 ** attempt)  # 1 s, 2 s, 4 s, 8 s
+                time.sleep(2 ** attempt)
 
         if last_exc:
             raise last_exc
@@ -255,7 +492,6 @@ def fetch_wb_indicator(
 
         for item in data[1]:
             country_id = item.get("country", {}).get("id", "")
-            # Skip regional / income-group aggregates (IDs are 3+ chars: EAP, LMC, WLD…)
             if fetch_all and len(country_id) != 2:
                 continue
             all_rows.append({
@@ -290,140 +526,14 @@ def get_wb_countries() -> pd.DataFrame:
     rows   = [
         {"name": c["name"], "iso2": c["id"]}
         for c in data[1]
-        if c.get("region", {}).get("id") != "NA"   # drop aggregates
+        if c.get("region", {}).get("id") != "NA"
     ]
     return pd.DataFrame(rows).sort_values("name").reset_index(drop=True)
 
 
-# ── ECB FETCHERS ──────────────────────────────────────────────────────────────
-def fetch_ecb_daily(start_date, end_date) -> pd.DataFrame:
-    url    = "https://data-api.ecb.europa.eu/service/data/EXR/D.USD.EUR.SP00.A"
-    params = {
-        "startPeriod": start_date.strftime("%Y-%m-%d"),
-        "endPeriod":   end_date.strftime("%Y-%m-%d"),
-        "format":      "csvdata",
-    }
-    raw = pd.read_csv(StringIO(requests.get(url, params=params, timeout=30).text))
-    df  = raw[["TIME_PERIOD", "OBS_VALUE"]].copy()
-    df.columns = ["Date", "EUR_USD"]
-    df["Date"]    = pd.to_datetime(df["Date"])
-    df["EUR_USD"] = pd.to_numeric(df["EUR_USD"], errors="coerce")
-    df = df.dropna().sort_values("Date").reset_index(drop=True)
-    df["EUR_USD"] = df["EUR_USD"].apply(precise_round)
-    df["USD_EUR"] = (1 / df["EUR_USD"]).apply(precise_round)
-    return df
-
-
-def fetch_ecb_monthly(start_date, end_date) -> pd.DataFrame:
-    url    = "https://data-api.ecb.europa.eu/service/data/EXR/M.USD.EUR.SP00.A"
-    params = {
-        "startPeriod": start_date.strftime("%Y-%m"),
-        "endPeriod":   end_date.strftime("%Y-%m"),
-        "format":      "csvdata",
-    }
-    raw = pd.read_csv(StringIO(requests.get(url, params=params, timeout=30).text))
-    df  = raw[["TIME_PERIOD", "OBS_VALUE"]].copy()
-    df.columns = ["Month", "EUR_USD"]
-    df["EUR_USD"]    = pd.to_numeric(df["EUR_USD"], errors="coerce")
-    df = df.dropna().sort_values("Month").reset_index(drop=True)
-    df["Year"]       = df["Month"].str[:4]
-    df["Month Name"] = pd.to_datetime(df["Month"]).dt.strftime("%B")
-    df["EUR_USD"]    = df["EUR_USD"].apply(precise_round)
-    df["USD_EUR"]    = (1 / df["EUR_USD"]).apply(precise_round)
-    return df
-
-
-# ── EXCEL BUILDERS ────────────────────────────────────────────────────────────
-def build_fx_sheets(wb: Workbook, start_date, end_date):
-    df_d = fetch_ecb_daily(start_date, end_date)
-
-    # ── Annual ──────────────────────────────────────────────────────────────
-    ws_a = wb.active
-    ws_a.title = "ECB - FX - Annual"
-    df_a = df_d.groupby(df_d["Date"].dt.year)["EUR_USD"].mean().reset_index()
-    df_a.columns = ["Year", "EUR_USD"]
-    df_a["USD_EUR"] = (1 / df_a["EUR_USD"]).apply(precise_round)
-    df_a["EUR_USD"] = df_a["EUR_USD"].apply(precise_round)
-    write_headers(ws_a, ["Year", "Avg EUR/USD", "Avg USD/EUR"])
-    for i, row in df_a.iterrows():
-        r = i + 2
-        ws_a.cell(r, 1, int(row["Year"]))
-        ws_a.cell(r, 2, row["EUR_USD"])
-        ws_a.cell(r, 3, row["USD_EUR"])
-        style_row(ws_a, r, 3, i % 2 == 0)
-    set_widths(ws_a, {"A": 10, "B": 15, "C": 15})
-
-    # ── Monthly ─────────────────────────────────────────────────────────────
-    ws_m = wb.create_sheet("ECB - FX - Monthly")
-    df_m = fetch_ecb_monthly(start_date, end_date)
-    write_headers(ws_m, ["Month", "Year", "Month Name", "EUR/USD", "USD/EUR"])
-    for i, row in df_m.iterrows():
-        r = i + 2
-        ws_m.cell(r, 1, row["Month"])
-        ws_m.cell(r, 2, row["Year"])
-        ws_m.cell(r, 3, row["Month Name"])
-        ws_m.cell(r, 4, row["EUR_USD"])
-        ws_m.cell(r, 5, row["USD_EUR"])
-        style_row(ws_m, r, 5, i % 2 == 0)
-    set_widths(ws_m, {"A": 12, "B": 8, "C": 14, "D": 14, "E": 14})
-
-    # ── Weekly ──────────────────────────────────────────────────────────────
-    # ECB publishes Mon–Fri only.
-    # "Week Start" = Monday, "Week End" = Friday (Mon + 4 days).
-    ws_w = wb.create_sheet("ECB - FX - Weekly")
-    df_w = df_d.copy()
-    df_w["ISOYear"] = df_w["Date"].dt.isocalendar().year
-    df_w["ISOWeek"] = df_w["Date"].dt.isocalendar().week
-    df_weekly = df_w.groupby(["ISOYear", "ISOWeek"])["EUR_USD"].mean().reset_index()
-
-    def _monday(row):
-        return pd.to_datetime(
-            f"{int(row['ISOYear'])}-W{int(row['ISOWeek'])}-1", format="%G-W%V-%u"
-        ).strftime("%Y-%m-%d")
-
-    def _friday(row):
-        return (
-            pd.to_datetime(
-                f"{int(row['ISOYear'])}-W{int(row['ISOWeek'])}-1", format="%G-W%V-%u"
-            ) + pd.Timedelta(days=4)   # Monday + 4 = Friday
-        ).strftime("%Y-%m-%d")
-
-    df_weekly["Week Start (Mon)"] = df_weekly.apply(_monday,  axis=1)
-    df_weekly["Week End (Fri)"]   = df_weekly.apply(_friday,  axis=1)
-    df_weekly["USD_EUR"]          = (1 / df_weekly["EUR_USD"]).apply(precise_round)
-    df_weekly["EUR_USD"]          = df_weekly["EUR_USD"].apply(precise_round)
-
-    write_headers(ws_w, ["Year", "Week #", "Week Start (Mon)", "Week End (Fri)", "EUR/USD", "USD/EUR"])
-    for i, row in df_weekly.iterrows():
-        r = i + 2
-        ws_w.cell(r, 1, int(row["ISOYear"]))
-        ws_w.cell(r, 2, int(row["ISOWeek"]))
-        ws_w.cell(r, 3, row["Week Start (Mon)"])
-        ws_w.cell(r, 4, row["Week End (Fri)"])
-        ws_w.cell(r, 5, row["EUR_USD"])
-        ws_w.cell(r, 6, row["USD_EUR"])
-        style_row(ws_w, r, 6, i % 2 == 0)
-    set_widths(ws_w, {"A": 8, "B": 8, "C": 18, "D": 18, "E": 14, "F": 14})
-
-    # ── Daily ────────────────────────────────────────────────────────────────
-    ws_d = wb.create_sheet("ECB - FX - Daily")
-    write_headers(ws_d, ["Date", "EUR/USD", "USD/EUR"])
-    for i, row in df_d.iterrows():
-        r = i + 2
-        ws_d.cell(r, 1, row["Date"].strftime("%Y-%m-%d"))
-        ws_d.cell(r, 2, row["EUR_USD"])
-        ws_d.cell(r, 3, row["USD_EUR"])
-        style_row(ws_d, r, 3, i % 2 == 0)
-    set_widths(ws_d, {"A": 12, "B": 14, "C": 14})
-
-
 def build_wb_indicator_sheet(
-    wb: Workbook,
-    label: str,
-    indicator_code: str,
-    country_codes: list,
-    start_year: int,
-    end_year: int,
+    wb: Workbook, label: str, indicator_code: str,
+    country_codes: list, start_year: int, end_year: int,
 ) -> str:
     prefix     = "WB - "
     safe_title = (prefix + label)[:31]
@@ -452,7 +562,7 @@ def build_wb_indicator_sheet(
 
 # ── SOURCES SHEET ─────────────────────────────────────────────────────────────
 def build_sources_sheet(wb: Workbook, registry: list[dict]):
-    ws = wb.create_sheet("Sources", 0)   # always first tab
+    ws = wb.create_sheet("Sources", 0)
 
     title_cell = ws.cell(1, 1, "Data Sources")
     title_cell.font  = Font(bold=True, size=13, color="FFFFFF")
@@ -480,20 +590,231 @@ def build_sources_sheet(wb: Workbook, registry: list[dict]):
         style_row(ws, r, 5, i % 2 == 0)
 
 
+# ── STATA DO-FILE GENERATOR ───────────────────────────────────────────────────
+def _stata_varname(label: str) -> str:
+    import re
+    s = label.lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    return s.strip("_")[:32]
+
+
+def _stata_safe_dta(name: str) -> str:
+    import re
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", name).strip("_")
+
+
+def generate_stata_do(
+    sheet_registry: list[dict],
+    excel_filename: str,
+    today_str: str,
+    fx_pairs: list[tuple[str, str]],
+) -> str:
+    fx_entries = [e for e in sheet_registry if e["sheet_name"].startswith("ECB - FX")]
+    wb_entries = [e for e in sheet_registry if e["sheet_name"].startswith("WB - ")]
+
+    L: list[str] = []
+    sep  = "=" * 74
+    dash = "-" * 74
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    L += [
+        f"/* {sep}",
+        f"   Import - Ancillary data - {today_str}",
+        f"   Auto-generated by Ancillary data downloader on {today_str}",
+        f"   Excel source : {excel_filename}",
+        f"",
+        f"   INSTRUCTIONS",
+        f"   ------------",
+        f"   1. Place this .do file in the SAME FOLDER as the Excel file.",
+        f"   2. Set the global wd path below and uncomment the two lines.",
+        f"   3. Run the script. Each block saves a .dta in the same folder.",
+        f"",
+        f"   OUTPUT FILES",
+        f"   ------------",
+    ]
+    for e in fx_entries:
+        L.append(f"   {_stata_safe_dta(e['sheet_name'])}.dta")
+    for e in wb_entries:
+        L.append(f"   {_stata_safe_dta(e['sheet_name'])}.dta")
+    if len(wb_entries) > 1:
+        L.append(f"   WB_panel_combined.dta   (all WB indicators merged on countrycode + year)")
+    L += [f"{sep} */", ""]
+
+    L += [
+        "* ── Working directory (edit and uncomment) ──────────────────────────── *",
+        '* global wd "C:/your/folder/path"',
+        '* cd "${wd}"',
+        "",
+        f'local excel "{excel_filename}"',
+        "",
+    ]
+
+    # ── Section 1: FX ────────────────────────────────────────────────────────
+    if fx_entries and fx_pairs:
+        base, quote  = fx_pairs[0]
+        fwd_col      = f"{base}/{quote}"
+        inv_col      = f"{quote}/{base}"
+        fwd_var      = f"{base.lower()}_{quote.lower()}"   # e.g. usd_eur
+        inv_var      = f"{quote.lower()}_{base.lower()}"   # e.g. eur_usd
+
+        # Fixed column layout per frequency (matches build_fx_sheets exactly)
+        FX_LAYOUT = {
+            "ECB - FX - Daily": {
+                "date_cols":  [("A", "date_str",       "Date (YYYY-MM-DD)")],
+                "rate_cols":  [("B", fwd_var, fwd_col), ("C", inv_var, inv_col)],
+                "time_decl":  'gen date_daily = date(date_str, "YMD")\nformat date_daily %td\ntsset date_daily',
+            },
+            "ECB - FX - Weekly": {
+                "date_cols":  [
+                    ("A", "year",           "ISO year"),
+                    ("B", "week_no",        "ISO week number"),
+                    ("C", "week_start_mon", "Week start (Monday, YYYY-MM-DD)"),
+                    ("D", "week_end_fri",   "Week end (Friday, YYYY-MM-DD)"),
+                ],
+                "rate_cols":  [("E", fwd_var, fwd_col), ("F", inv_var, inv_col)],
+                "time_decl":  'gen date_weekly = date(week_start_mon, "YMD")\nformat date_weekly %td\ntsset date_weekly',
+            },
+            "ECB - FX - Monthly": {
+                "date_cols":  [
+                    ("A", "month",      "Month (YYYY-MM)"),
+                    ("B", "year",       "Year"),
+                    ("C", "month_name", "Month name"),
+                ],
+                "rate_cols":  [("D", fwd_var, fwd_col), ("E", inv_var, inv_col)],
+                "time_decl":  'gen date_monthly = monthly(month, "YM")\nformat date_monthly %tm\ntsset date_monthly',
+            },
+            "ECB - FX - Annual": {
+                "date_cols":  [("A", "year", "Year")],
+                "rate_cols":  [("B", fwd_var, f"Avg {fwd_col}"), ("C", inv_var, f"Avg {inv_col}")],
+                "time_decl":  "",
+            },
+        }
+
+        L += [
+            f"/* {dash}",
+            f"   SECTION 1 — ECB Exchange Rates",
+            f"   Pair   : {fwd_col}  (and inverse {inv_col})",
+            f"   Source : {ECB_SOURCE['source_name']}",
+            f"   URL    : {ECB_SOURCE['source_url']}",
+            f"   Notes  : {ECB_SOURCE['notes']}",
+            f"{dash} */",
+            "",
+        ]
+
+        for entry in fx_entries:
+            sname     = entry["sheet_name"]
+            dta       = _stata_safe_dta(sname) + ".dta"
+            layout    = FX_LAYOUT.get(sname, {})
+            date_cols = layout.get("date_cols", [])
+            rate_cols = layout.get("rate_cols", [])
+            time_decl = layout.get("time_decl", "")
+
+            L.append(f"* ── {sname} {'─' * max(1, 60 - len(sname))}")
+            L.append(f'import excel using "`excel\'", sheet("{sname}") cellrange(A2) clear')
+            L.append("")
+            L.append("* Rename columns")
+            for col, var, _ in date_cols + rate_cols:
+                L.append(f"rename {col} {var}")
+            L.append("")
+            L.append("* Variable labels")
+            for _, var, lbl in date_cols + rate_cols:
+                L.append(f'label variable {var} "{lbl}"')
+            L.append("")
+            if time_decl:
+                L.append("* Declare time series")
+                for tl in time_decl.split("\n"):
+                    L.append(tl)
+                L.append("")
+            L.append(f'save "{dta}", replace')
+            L.append("")
+
+    # ── Section 2: World Bank ─────────────────────────────────────────────────
+    if wb_entries:
+        L += [
+            f"/* {dash}",
+            f"   SECTION 2 — World Bank Indicators",
+            f"   Source : World Bank Open Data — World Development Indicators",
+            f"   URL    : https://data.worldbank.org/indicator/",
+            f"   Notes  : Annual frequency. Panel: countrycode (ISO-3) × year.",
+            f"{dash} */",
+            "",
+        ]
+
+        saved_dtas: list[tuple[str, str]] = []
+
+        for entry in wb_entries:
+            sname   = entry["sheet_name"]
+            label   = entry["dataset"]
+            code    = entry["source_url"].split("/")[-1]
+            varname = _stata_varname(label)
+            dta     = _stata_safe_dta(sname) + ".dta"
+            note    = WB_INDICATOR_NOTES.get(code, "World Development Indicators (WDI).")
+
+            L.append(f"* ── {label}  [{code}] {'─' * max(1, 50 - len(label))}")
+            L.append(f'import excel using "`excel\'", sheet("{sname}") cellrange(A2) clear')
+            L.append("")
+            L.append("* Rename columns")
+            L += ["rename A country", "rename B countrycode", "rename C year", f"rename D {varname}"]
+            L.append("")
+            L.append("* Variable labels")
+            L += [
+                'label variable country     "Country name"',
+                'label variable countrycode "ISO-3 country code"',
+                'label variable year        "Year"',
+                f'label variable {varname} "{label} — {note}"',
+            ]
+            L.append("")
+            L.append("destring year, replace")
+            L.append("")
+            L.append(f'save "{dta}", replace')
+            L.append("")
+            saved_dtas.append((dta, varname))
+
+        if len(saved_dtas) > 1:
+            L += [
+                f"/* {dash}",
+                f"   SECTION 2b — World Bank Combined Panel",
+                f"   Merges all WB .dta files on countrycode + year.",
+                f"{dash} */",
+                "",
+            ]
+            L.append(f'use "{saved_dtas[0][0]}", clear')
+            L.append("")
+            for dta, var in saved_dtas[1:]:
+                L += [f'merge 1:1 countrycode year using "{dta}", ///', f"    keepusing({var}) nogenerate", ""]
+            L += [
+                "encode countrycode, gen(country_id)",
+                "xtset country_id year",
+                "sort countrycode year",
+                "",
+                'save "WB_panel_combined.dta", replace',
+                "",
+            ]
+        elif len(saved_dtas) == 1:
+            L += ["* Only one WB indicator — no panel merge needed.", f'* Dataset saved as: "{saved_dtas[0][0]}"', ""]
+
+    L += [f"/* {sep}", f"   End of do-file — Import - Ancillary data - {today_str}", f"{sep} */"]
+    return "\n".join(L)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # UI
 # ═════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <div class="app-header">
-  <h1>🌐 Global Data Downloader</h1>
+  <h1>🌐 Ancillary data downloader</h1>
   <p>Select only the datasets you need — data is fetched on demand and exported to a single Excel file.</p>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── SECTION 1 — EUR/USD ───────────────────────────────────────────────────────
-with st.expander("📈  EUR/USD Exchange Rate  (ECB)", expanded=True):
-    include_fx = st.checkbox("Include EUR/USD exchange rate data", value=True)
+# ── SECTION 1 — FX ───────────────────────────────────────────────────────────
+with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
+    include_fx = st.checkbox("Include exchange rate data", value=True)
+
+    fx_base  = "USD"
+    fx_quote = "EUR"
+
     if include_fx:
         c1, c2 = st.columns(2)
         with c1:
@@ -502,7 +823,46 @@ with st.expander("📈  EUR/USD Exchange Rate  (ECB)", expanded=True):
             fx_end = st.date_input("End date", pd.to_datetime("today"), key="fx_end")
         if fx_start > fx_end:
             st.error("Start date must be before end date.")
-        st.caption("Produces 4 sheets: Annual · Monthly · Weekly (Mon–Fri) · Daily")
+
+        st.markdown("**Select your currency pair**")
+        p1, p2 = st.columns(2)
+        with p1:
+            base_raw = st.selectbox(
+                "🏦 I have (base currency)",
+                options=CURRENCY_OPTIONS,
+                index=CURRENCY_OPTIONS.index("USD — US Dollar"),
+                key="fx_base",
+                help="The currency you are converting FROM. E.g. if you want to know how many EUR one USD buys, select USD here.",
+            )
+        with p2:
+            quote_raw = st.selectbox(
+                "💰 I want (quote currency)",
+                options=CURRENCY_OPTIONS,
+                index=CURRENCY_OPTIONS.index("EUR — Euro"),
+                key="fx_quote",
+                help="The currency you are converting TO. The rate tells you how many units of this currency one unit of the base buys.",
+            )
+
+        fx_base  = base_raw.split(" — ")[0]
+        fx_quote = quote_raw.split(" — ")[0]
+
+        if fx_base == fx_quote:
+            st.error("Base and quote currencies must be different.")
+        else:
+            fwd = f"{fx_base}/{fx_quote}"
+            inv = f"{fx_quote}/{fx_base}"
+            base_name  = CURRENCY_CATALOGUE[fx_base]
+            quote_name = CURRENCY_CATALOGUE[fx_quote]
+            st.markdown(
+                f'<div class="info-banner">'
+                f'✔ <strong>{fwd}</strong> — how many <strong>{fx_quote} ({quote_name})</strong> '
+                f'you get for 1 <strong>{fx_base} ({base_name})</strong>'
+                f'<br>The inverse <strong>{inv}</strong> will also be included in every sheet.'
+                f'<br><small>Source: ECB Statistical Data Warehouse. Cross rates derived via EUR where needed.</small>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Produces 4 sheets: Annual · Monthly · Weekly (Mon–Fri) · Daily")
 
 
 # ── SECTION 2 — World Bank ────────────────────────────────────────────────────
@@ -515,11 +875,9 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
     wb_end_year   = 2023
 
     if include_wb:
-        # ── Indicator picker: one multiselect per themed group ────────────
         st.markdown("**Select indicators** — one Excel sheet per indicator")
         st.markdown(
-            '<div class="info-banner">20 indicators across 6 themes. '
-            "Expand a group dropdown and tick what you need.</div>",
+            '<div class="info-banner">20 indicators across 6 themes.</div>',
             unsafe_allow_html=True,
         )
 
@@ -542,7 +900,6 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
                 unsafe_allow_html=True,
             )
 
-        # ── Year range ────────────────────────────────────────────────────
         st.markdown("**Year range**")
         y1, y2 = st.columns(2)
         with y1:
@@ -550,7 +907,6 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
         with y2:
             wb_end_year   = st.number_input("To year",   min_value=1960, max_value=2024, value=2023, step=1)
 
-        # ── Country picker ────────────────────────────────────────────────
         st.markdown("**Countries** — leave blank to include all countries")
         try:
             all_countries_df = get_wb_countries()
@@ -565,8 +921,7 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
             selected_countries = [iso2_map[n] for n in chosen_names] if chosen_names else ["all"]
             if not chosen_names:
                 st.markdown(
-                    '<div class="warn-banner">⚠ Fetching all countries can be slow for long date ranges or many indicators. '
-                    "Consider selecting specific countries or a shorter period.</div>",
+                    '<div class="warn-banner">⚠ Fetching all countries can be slow for long date ranges or many indicators.</div>',
                     unsafe_allow_html=True,
                 )
         except Exception:
@@ -575,48 +930,54 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
 
 
 # ── GENERATE ──────────────────────────────────────────────────────────────────
-nothing_selected = (not include_fx) and (not include_wb or not selected_indicators)
+fx_ready = include_fx and (fx_base != fx_quote)
+nothing_selected = (not fx_ready) and (not include_wb or not selected_indicators)
 
 if nothing_selected:
     st.info("☝ Expand a section above and select at least one dataset to enable the download.")
 else:
-    if st.button("🚀  Generate & Download Excel"):
+    if st.button("🚀  Generate & Download"):
         all_ok = True
 
-        if include_fx and fx_start > fx_end:
-            st.error("Fix the FX date range first.")
-            all_ok = False
+        if include_fx:
+            if fx_start > fx_end:
+                st.error("Fix the FX date range first.")
+                all_ok = False
+            if fx_base == fx_quote:
+                st.error("Base and quote currencies must be different.")
+                all_ok = False
         if include_wb and wb_start_year > wb_end_year:
             st.error("'From year' must be ≤ 'To year'.")
             all_ok = False
 
         if all_ok:
-            wb_excel: Workbook          = Workbook()
-            sheet_registry: list[dict]  = []
-            first_added                 = False
-            total_steps = (4 if include_fx else 0) + len(selected_indicators)
+            wb_excel: Workbook         = Workbook()
+            sheet_registry: list[dict] = []
+            first_added                = False
+            total_steps = (4 if fx_ready else 0) + len(selected_indicators)
             progress    = st.progress(0, text="Starting…")
             step        = 0
 
-            # ── FX sheets ─────────────────────────────────────────────────
-            if include_fx:
-                progress.progress(0, text="Fetching EUR/USD data from ECB…")
+            # ── FX ────────────────────────────────────────────────────────
+            if fx_ready:
+                fwd_label = f"{fx_base}/{fx_quote}"
+                progress.progress(0, text=f"Fetching {fwd_label} data from ECB…")
                 try:
-                    build_fx_sheets(wb_excel, fx_start, fx_end)
+                    build_fx_sheets(wb_excel, fx_base, fx_quote, fx_start, fx_end)
                     first_added = True
-                    for period in ["Annual", "Monthly", "Weekly", "Daily"]:
+                    for period in ["Daily", "Weekly", "Monthly", "Annual"]:
                         sheet_registry.append({
                             "sheet_name":  f"ECB - FX - {period}",
-                            "dataset":     f"EUR/USD Exchange Rate — {period}",
+                            "dataset":     f"{fwd_label} Exchange Rate — {period}",
                             **ECB_SOURCE,
                         })
                     step += 4
-                    progress.progress(step / total_steps, text="EUR/USD data loaded ✓")
+                    progress.progress(step / total_steps, text=f"{fwd_label} data loaded ✓")
                 except Exception as e:
                     st.error(f"Error fetching FX data: {e}")
                     all_ok = False
 
-            # ── World Bank sheets ─────────────────────────────────────────
+            # ── World Bank ────────────────────────────────────────────────
             if include_wb and all_ok:
                 if not first_added:
                     wb_excel.active.title = "_tmp"
@@ -644,33 +1005,44 @@ else:
             if "_tmp" in wb_excel.sheetnames:
                 del wb_excel["_tmp"]
 
-            # ── Sources sheet (tab #1) ────────────────────────────────────
+            # ── Sources + save ────────────────────────────────────────────
             progress.progress(0.97, text="Writing Sources sheet…")
             build_sources_sheet(wb_excel, sheet_registry)
             progress.progress(1.0, text="Saving…")
 
             if all_ok:
+                today_str = pd.Timestamp.today().strftime("%Y-%m-%d")
+
                 tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
                 wb_excel.save(tmp.name)
+                with open(tmp.name, "rb") as f:
+                    excel_bytes = f.read()
 
                 fname_parts = []
-                if include_fx:
-                    fname_parts.append(f"FX_{fx_start}_to_{fx_end}")
+                if fx_ready:
+                    fname_parts.append(f"FX_{fx_base}_{fx_quote}_{fx_start}_to_{fx_end}")
                 if include_wb and selected_indicators:
                     fname_parts.append(f"WB_{int(wb_start_year)}-{int(wb_end_year)}")
-                filename = "Ancillary Data - " +  "_".join(fname_parts) + ".xlsx"
+                excel_filename = "_".join(fname_parts) + ".xlsx"
 
-                with open(tmp.name, "rb") as f:
-                    st.download_button(
-                        "📥  Download Excel",
-                        f,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+                do_content  = generate_stata_do(sheet_registry, excel_filename, today_str, [(fx_base, fx_quote)] if fx_ready else [])
+                do_filename = f"Import - Ancillary data - {today_str}.do"
+
+                zip_buffer = BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    zf.writestr(excel_filename, excel_bytes)
+                    zf.writestr(do_filename, do_content.encode("utf-8"))
+                zip_buffer.seek(0)
 
                 progress.empty()
                 n = len(wb_excel.sheetnames)
                 st.success(
-                    f"✅ Done! {n} sheet{'s' if n != 1 else ''} exported "
-                    f"(Sources tab included)."
+                    f"✅ Done! {n} sheet{'s' if n != 1 else ''} in the Excel "
+                    f"+ Stata .do file — both packed in the zip below."
+                )
+                st.download_button(
+                    "📦  Download Excel + Stata .do  (.zip)",
+                    zip_buffer,
+                    file_name=f"Ancillary_data_{today_str}.zip",
+                    mime="application/zip",
                 )
