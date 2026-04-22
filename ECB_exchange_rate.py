@@ -933,7 +933,7 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
         with y2:
             wb_end_year   = st.number_input("To year",   min_value=1960, max_value=2024, value=2023, step=1)
 
-        st.markdown("**Countries** — leave blank to include all countries")
+        st.markdown("**Countries**")
 
         COUNTRY_GROUPS = {
             "G7": ["Canada", "France", "Germany", "Italy", "Japan",
@@ -997,7 +997,7 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
                 selected_countries = all_countries_df["iso2"].tolist()
             if not chosen_names:
                 st.markdown(
-                    '<div class="warn-banner">⚠ Fetching all countries can be slow for long date ranges or many indicators.</div>',
+                    '<div class="warn-banner">⚠ Be sure to select at least one country or region of interest.</div>',
                     unsafe_allow_html=True,
                 )
         except Exception:
