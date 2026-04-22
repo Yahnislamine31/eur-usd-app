@@ -8,6 +8,7 @@ from openpyxl.styles import Font, PatternFill, Alignment
 import tempfile
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
@@ -63,15 +64,28 @@ st.markdown("""
     .stButton > button {
         background: #003366 !important;
         color: #fff !important;
-        font-family: 'IBM Plex Mono', monospace !important;
-        font-weight: 600 !important;
+        font-family: 'Inter', sans-serif !important;
+        font-weight: 500 !important;
         border: none !important;
-        border-radius: 7px !important;
-        padding: 0.65rem 2rem !important;
+        border-radius: 5px !important;
+        padding: 0.35rem 0.5rem !important;
         width: 100% !important;
-        font-size: 0.98rem !important;
+        font-size: 0.80rem !important;
+        white-space: nowrap !important;
+        min-height: 0 !important;
+        line-height: 1.3 !important;
     }
     .stButton > button:hover { background: #0055a4 !important; }
+    .stButton > button[kind="primary"] {
+        font-family: 'IBM Plex Mono', monospace !important;
+        font-weight: 600 !important;
+        border-radius: 7px !important;
+        padding: 0.65rem 2rem !important;
+        font-size: 0.98rem !important;
+        white-space: normal !important;
+        min-height: auto !important;
+        line-height: normal !important;
+    }
     .stDownloadButton > button {
         background: #1a7f37 !important;
         color: #fff !important;
@@ -285,7 +299,7 @@ def fetch_ecb_vs_eur(
         }
         date_col = "Month"
 
-    raw  = pd.read_csv(StringIO(requests.get(url, params=params, timeout=30).text))
+    raw  = pd.read_csv(StringIO(requests.get(url, params=params, timeout=100).text))
     # ECB CSV has CURRENCY and TIME_PERIOD columns
     df   = raw[["CURRENCY", "TIME_PERIOD", "OBS_VALUE"]].copy()
     df.columns = ["Currency", date_col, "Rate"]
@@ -342,6 +356,10 @@ def build_fx_sheets(wb: Workbook, base: str, quote: str, start_date, end_date):
     non_eur = [c for c in [base, quote] if c != "EUR"]
     wide_d = fetch_ecb_vs_eur(non_eur, start_date, end_date, frequency="D")
     wide_m = fetch_ecb_vs_eur(non_eur, start_date, end_date, frequency="M")
+
+    wide_d.index = pd.to_datetime(wide_d.index)
+    wide_d.index = wide_d.index.strftime('%Y-%m-%d')
+    wide_d.index.name = "Date"
 
     fwd_col  = f"{base}/{quote}"       # e.g. USD/EUR
     inv_col  = f"{quote}/{base}"       # e.g. EUR/USD
@@ -531,10 +549,10 @@ def get_wb_countries() -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("name").reset_index(drop=True)
 
 
-def build_wb_indicator_sheet(
-    wb: Workbook, label: str, indicator_code: str,
-    country_codes: list, start_year: int, end_year: int,
+def _build_wb_sheet_from_df(
+    wb: Workbook, label: str, df: pd.DataFrame,
 ) -> str:
+    """Write a pre-fetched World Bank DataFrame into a new worksheet."""
     prefix     = "WB - "
     safe_title = (prefix + label)[:31]
     existing   = {s.title for s in wb.worksheets}
@@ -542,7 +560,6 @@ def build_wb_indicator_sheet(
         safe_title = safe_title[:28] + "_2"
 
     ws = wb.create_sheet(safe_title)
-    df = fetch_wb_indicator(indicator_code, tuple(country_codes), start_year, end_year)
 
     if df.empty:
         ws.cell(1, 1, "No data returned by the World Bank API for these parameters.")
@@ -554,10 +571,19 @@ def build_wb_indicator_sheet(
         ws.cell(r, 1, row["Country"])
         ws.cell(r, 2, row["Country Code"])
         ws.cell(r, 3, int(row["Year"]))
-        ws.cell(r, 4, row["Value"])
+        val_cell = ws.cell(r, 4, row["Value"])
+        val_cell.number_format = '#,##0'
         style_row(ws, r, 4, i % 2 == 0)
     set_widths(ws, {"A": 28, "B": 14, "C": 8, "D": 26})
     return safe_title
+
+
+def build_wb_indicator_sheet(
+    wb: Workbook, label: str, indicator_code: str,
+    country_codes: list, start_year: int, end_year: int,
+) -> str:
+    df = fetch_wb_indicator(indicator_code, tuple(country_codes), start_year, end_year)
+    return _build_wb_sheet_from_df(wb, label, df)
 
 
 # ── SOURCES SHEET ─────────────────────────────────────────────────────────────
@@ -908,6 +934,53 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
             wb_end_year   = st.number_input("To year",   min_value=1960, max_value=2024, value=2023, step=1)
 
         st.markdown("**Countries** — leave blank to include all countries")
+
+        COUNTRY_GROUPS = {
+            "G7": ["Canada", "France", "Germany", "Italy", "Japan",
+                   "United Kingdom", "United States"],
+            "G20": ["Argentina", "Australia", "Brazil", "Canada", "China",
+                    "France", "Germany", "India", "Indonesia", "Italy",
+                    "Japan", "Korea, Rep.", "Mexico", "Russian Federation",
+                    "Saudi Arabia", "South Africa", "Turkiye",
+                    "United Kingdom", "United States"],
+            "BRICS": ["Brazil", "Russian Federation", "India", "China",
+                      "South Africa", "Egypt, Arab Rep.", "Ethiopia",
+                      "Iran, Islamic Rep.", "Saudi Arabia",
+                      "United Arab Emirates"],
+            "EU": ["Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus",
+                   "Czechia", "Denmark", "Estonia", "Finland", "France",
+                   "Germany", "Greece", "Hungary", "Ireland", "Italy",
+                   "Latvia", "Lithuania", "Luxembourg", "Malta",
+                   "Netherlands", "Poland", "Portugal", "Romania",
+                   "Slovak Republic", "Slovenia", "Spain", "Sweden"],
+            "OECD": ["Australia", "Austria", "Belgium", "Canada", "Chile",
+                     "Colombia", "Costa Rica", "Czechia", "Denmark",
+                     "Estonia", "Finland", "France", "Germany", "Greece",
+                     "Hungary", "Iceland", "Ireland", "Israel", "Italy",
+                     "Japan", "Korea, Rep.", "Latvia", "Lithuania",
+                     "Luxembourg", "Mexico", "Netherlands", "New Zealand",
+                     "Norway", "Poland", "Portugal", "Slovak Republic",
+                     "Slovenia", "Spain", "Sweden", "Switzerland",
+                     "Turkiye", "United Kingdom", "United States"],
+            "EEA": ["Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czechia",
+                    "Denmark", "Estonia", "Finland", "France", "Germany", "Greece",
+                    "Hungary", "Iceland", "Ireland", "Italy", "Latvia", "Liechtenstein",
+                    "Lithuania", "Luxembourg", "Malta", "Netherlands", "Norway",
+                    "Poland", "Portugal", "Romania", "Slovak Republic", "Slovenia",
+                    "Spain", "Sweden"
+            ]
+        }
+
+        def update_countries(country_list):
+            st.session_state["wb_countries"] = country_list
+
+        btn_cols = st.columns(7)
+        for col, (group_name, group_list) in zip(btn_cols, COUNTRY_GROUPS.items()):
+            col.button(group_name, on_click=update_countries, args=(group_list,),
+                       key=f"btn_{group_name}", use_container_width=True)
+        btn_cols[6].button("Clear", on_click=update_countries, args=([],),
+                           key="btn_clear", use_container_width=True)
+
         try:
             all_countries_df = get_wb_countries()
             iso2_map         = dict(zip(all_countries_df["name"], all_countries_df["iso2"]))
@@ -918,7 +991,10 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
                 placeholder="All countries  (slower for long date ranges)",
                 key="wb_countries",
             )
-            selected_countries = [iso2_map[n] for n in chosen_names] if chosen_names else ["all"]
+            if chosen_names:
+                selected_countries = [iso2_map[n] for n in chosen_names]
+            else:
+                selected_countries = all_countries_df["iso2"].tolist()
             if not chosen_names:
                 st.markdown(
                     '<div class="warn-banner">⚠ Fetching all countries can be slow for long date ranges or many indicators.</div>',
@@ -936,7 +1012,7 @@ nothing_selected = (not fx_ready) and (not include_wb or not selected_indicators
 if nothing_selected:
     st.info("☝ Expand a section above and select at least one dataset to enable the download.")
 else:
-    if st.button("🚀  Generate & Download"):
+    if st.button("🚀  Generate & Download", type="primary"):
         all_ok = True
 
         if include_fx:
@@ -977,30 +1053,41 @@ else:
                     st.error(f"Error fetching FX data: {e}")
                     all_ok = False
 
-            # ── World Bank ────────────────────────────────────────────────
+            # ── World Bank (concurrent fetch) ────────────────────────────
             if include_wb and all_ok:
                 if not first_added:
                     wb_excel.active.title = "_tmp"
                     first_added = True
 
-                for label, code in selected_indicators:
-                    step += 1
-                    progress.progress(step / total_steps, text=f"Fetching: {label}…")
-                    try:
-                        sname = build_wb_indicator_sheet(
-                            wb_excel, label, code,
-                            selected_countries,
-                            int(wb_start_year), int(wb_end_year),
-                        )
-                        sheet_registry.append({
-                            "sheet_name":  sname,
-                            "dataset":     label,
-                            "source_name": "World Bank Open Data",
-                            "source_url":  f"https://data.worldbank.org/indicator/{code}",
-                            "notes":       WB_INDICATOR_NOTES.get(code, "World Development Indicators (WDI)."),
-                        })
-                    except Exception as e:
-                        st.warning(f"Could not fetch '{label}': {e}")
+                progress.progress(step / total_steps, text="Fetching World Bank indicators…")
+                with ThreadPoolExecutor(max_workers=100) as executor:
+                    futures = {
+                        executor.submit(
+                            fetch_wb_indicator,
+                            code,
+                            tuple(selected_countries),
+                            int(wb_start_year),
+                            int(wb_end_year),
+                        ): (label, code)
+                        for label, code in selected_indicators
+                    }
+
+                    for future in as_completed(futures):
+                        label, code = futures[future]
+                        step += 1
+                        progress.progress(step / total_steps, text=f"Processing: {label}…")
+                        try:
+                            df = future.result()
+                            sname = _build_wb_sheet_from_df(wb_excel, label, df)
+                            sheet_registry.append({
+                                "sheet_name":  sname,
+                                "dataset":     label,
+                                "source_name": "World Bank Open Data",
+                                "source_url":  f"https://data.worldbank.org/indicator/{code}",
+                                "notes":       WB_INDICATOR_NOTES.get(code, "World Development Indicators (WDI)."),
+                            })
+                        except Exception as e:
+                            st.warning(f"Could not fetch '{label}': {e}")
 
             if "_tmp" in wb_excel.sheetnames:
                 del wb_excel["_tmp"]
@@ -1040,6 +1127,7 @@ else:
                     f"✅ Done! {n} sheet{'s' if n != 1 else ''} in the Excel "
                     f"+ Stata .do file — both packed in the zip below."
                 )
+
                 st.download_button(
                     "📦  Download Excel + Stata .do  (.zip)",
                     zip_buffer,
