@@ -147,7 +147,7 @@ CURRENCY_CATALOGUE: dict[str, str] = {
 
 # Currency options for the multiselect: "USD — US Dollar"
 CURRENCY_OPTIONS = [f"{code} — {name}" for code, name in CURRENCY_CATALOGUE.items()]
-DEFAULT_BASE_CURRENCIES = ["USD — US Dollar", "GBP — British Pound", "JPY — Japanese Yen", "CHF — Swiss Franc"]
+DEFAULT_BASE_CURRENCIES = ["USD — US Dollar", "GBP — British Pound"]
 
 
 # ── WORLD BANK CONSTANTS ──────────────────────────────────────────────────────
@@ -760,9 +760,9 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
     if include_fx:
         c1, c2 = st.columns(2)
         with c1:
-            fx_start = st.date_input("Start date", pd.to_datetime("2015-01-01"), key="fx_start")
+            fx_start = st.date_input("Start date (YYYY-MM-DD)", pd.to_datetime("2015-01-01"), key="fx_start")
         with c2:
-            fx_end = st.date_input("End date", pd.to_datetime("today"), key="fx_end")
+            fx_end = st.date_input("End date (YYYY-MM-DD)", pd.to_datetime("today"), key="fx_end")
         if fx_start > fx_end:
             st.error("Start date must be before end date.")
 
@@ -796,25 +796,27 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
                 f'<div class="info-banner">'
                 f'✔ <strong>{pair_list}</strong> — and their inverses — will be included, '
                 f'all against <strong>{fx_quote} ({quote_name})</strong>.'
-                f'<br><small>Source: ECB Statistical Data Warehouse. One API call covers every pair above.</small>'
+                f'<br><small>Source: ECB Statistical Data Warehouse. The ECB only publishes rates against EUR, '
+                f'so any pair where neither side is EUR (e.g. JPY vs CHF) is derived automatically by cross-dividing '
+                f'through EUR (JPY/EUR ÷ CHF/EUR).</small>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
             st.markdown("**Frequencies to compute (in Stata)**")
             fx_frequencies = st.multiselect(
-                "The Excel file only ever holds the raw daily series",
+                "The Excel (input) file only ever holds the raw daily series",
                 options=["Weekly", "Monthly", "Quarterly", "Annual"],
-                default=[],
+                default=["Monthly"],
                 placeholder="— none selected (daily only) —",
                 key="fx_frequencies",
             )
             st.caption(
                 "Each one you pick is a simple average of the daily rate over the period, "
-                "computed directly in the generated .do file so the calculation stays fully visible."
+                "computed directly in the generated .do file."
             )
 
             span_days = (fx_end - fx_start).days
-            MIN_DAYS_FOR_FREQ = {"Weekly": 7, "Monthly": 31, "Quarterly": 93, "Annual": 366}
+            MIN_DAYS_FOR_FREQ = {"Weekly": 5, "Monthly": 27, "Quarterly": 89, "Annual": 365}
             too_short = [f for f in fx_frequencies if span_days < MIN_DAYS_FOR_FREQ[f]]
             if too_short:
                 st.markdown(
