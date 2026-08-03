@@ -147,6 +147,7 @@ CURRENCY_CATALOGUE: dict[str, str] = {
 
 # Currency options for the multiselect: "USD — US Dollar"
 CURRENCY_OPTIONS = [f"{code} — {name}" for code, name in CURRENCY_CATALOGUE.items()]
+DEFAULT_BASE_CURRENCIES = ["USD — US Dollar", "GBP — British Pound", "JPY — Japanese Yen", "CHF — Swiss Franc"]
 
 
 # ── WORLD BANK CONSTANTS ──────────────────────────────────────────────────────
@@ -312,18 +313,19 @@ def fetch_ecb_vs_eur(
 
 
 # ── EXCEL BUILDERS ────────────────────────────────────────────────────────────
-def build_fx_daily_sheet(wb: Workbook, base: str, quote: str, start_date, end_date):
+def build_fx_daily_sheet(wb: Workbook, bases: list[str], quote: str, start_date, end_date):
     """
-    Build the single "ECB - FX - Daily" sheet for one currency pair.
-    Columns: Date | BASE/QUOTE | QUOTE/BASE  (business days only, as published by the ECB).
+    Build the single "ECB - FX - Daily" sheet, covering every (base, quote) pair
+    at once via ONE ECB API call. Columns: Date, then BASE/QUOTE, QUOTE/BASE for
+    each base currency selected — e.g. Date, USD/EUR, EUR/USD, GBP/EUR, EUR/GBP.
 
     This is the ONLY FX sheet the Excel file contains. Weekly/Monthly/Quarterly/Annual
     figures are not pre-computed here — the generated Stata .do file derives them from
     this daily series (simple average of the daily rate within each period), so the
     calculation stays fully visible rather than being baked into the spreadsheet.
     """
-    # Currencies needed — if one is EUR we only need the other; ECB always quotes vs EUR
-    non_eur = [c for c in [base, quote] if c != "EUR"]
+    # Currencies needed from ECB — everything except EUR, which is always 1.0
+    non_eur = list(dict.fromkeys(c for c in bases + [quote] if c != "EUR"))
     wide = fetch_ecb_vs_eur(non_eur, start_date, end_date)
 
     wide.index = pd.to_datetime(wide.index)
@@ -331,25 +333,26 @@ def build_fx_daily_sheet(wb: Workbook, base: str, quote: str, start_date, end_da
     wide.index = wide.index.strftime('%Y-%m-%d')
     wide.index.name = "Date"
 
-    fwd_col = f"{base}/{quote}"       # e.g. USD/EUR
-    inv_col = f"{quote}/{base}"       # e.g. EUR/USD
-
-    b = wide[base].values   # numpy array — no ambiguity
-    q = wide[quote].values
     pairs = pd.DataFrame(index=wide.index)
-    pairs[fwd_col] = pd.Series(q / b, index=wide.index).apply(precise_round)
-    pairs[inv_col] = pd.Series(b / q, index=wide.index).apply(precise_round)
+    for base in bases:
+        fwd_col = f"{base}/{quote}"       # e.g. USD/EUR
+        inv_col = f"{quote}/{base}"       # e.g. EUR/USD
+        b = wide[base].values              # numpy array — no ambiguity
+        q = wide[quote].values
+        pairs[fwd_col] = pd.Series(q / b, index=wide.index).apply(precise_round)
+        pairs[inv_col] = pd.Series(b / q, index=wide.index).apply(precise_round)
 
     ws = wb.active
     ws.title = "ECB - FX - Daily"
-    write_headers(ws, ["Date", fwd_col, inv_col])
-    set_widths(ws, {"A": 14, "B": 16, "C": 16})
+    headers = ["Date"] + list(pairs.columns)
+    write_headers(ws, headers)
+    set_widths(ws, {"A": 14, **{col_letter(i): 16 for i in range(2, len(headers) + 1)}})
     for i, (date, row) in enumerate(pairs.iterrows()):
         r = i + 2
         ws.cell(r, 1, date)
-        ws.cell(r, 2, row[fwd_col])
-        ws.cell(r, 3, row[inv_col])
-        style_row(ws, r, 3, i % 2 == 0)
+        for j, col_name in enumerate(pairs.columns, start=2):
+            ws.cell(r, j, row[col_name])
+        style_row(ws, r, len(headers), i % 2 == 0)
 
 
 # ── WORLD BANK FETCHER ────────────────────────────────────────────────────────
@@ -519,7 +522,7 @@ def generate_stata_do(
     sheet_registry: list[dict],
     excel_filename: str,
     today_str: str,
-    fx_pair: tuple | None,
+    fx_pairs: list[tuple[str, str]],
     fx_frequencies: list[str],
 ) -> str:
     wb_entries = [e for e in sheet_registry if e["sheet_name"].startswith("WB - ")]
@@ -529,8 +532,10 @@ def generate_stata_do(
     dash = "-" * 74
 
     # Every FX .dta file this do-file will produce, in order (daily is always first).
+    # One file per frequency covers ALL pairs — a 2-pair or 5-pair request still
+    # produces the same 4-5 files, just with more columns in each.
     fx_dta_files: list[str] = []
-    if fx_pair:
+    if fx_pairs:
         fx_dta_files.append("ecb_fx_daily.dta")
         fx_dta_files += [f"ecb_fx_{freq.lower()}.dta" for freq in fx_frequencies]
 
@@ -568,17 +573,19 @@ def generate_stata_do(
     ]
 
     # ── Section 1: FX ────────────────────────────────────────────────────────
-    if fx_pair:
-        base, quote = fx_pair
-        fwd_col = f"{base}/{quote}"
-        inv_col = f"{quote}/{base}"
-        fwd_var = f"{base.lower()}_{quote.lower()}"   # e.g. usd_eur
-        inv_var = f"{quote.lower()}_{base.lower()}"   # e.g. eur_usd
+    if fx_pairs:
+        # var_pairs: (fwd_var, inv_var, fwd_col, inv_col) per pair, in sheet column order
+        var_pairs = [
+            (f"{base.lower()}_{quote.lower()}", f"{quote.lower()}_{base.lower()}",
+             f"{base}/{quote}", f"{quote}/{base}")
+            for base, quote in fx_pairs
+        ]
+        all_vars = [v for pair in var_pairs for v in pair[:2]]  # fwd_var, inv_var, per pair
 
         L += [
             f"/* {dash}",
             f"   SECTION 1 — ECB Exchange Rates",
-            f"   Pair   : {fwd_col}  (and inverse {inv_col})",
+            f"   Pairs  : {', '.join(f'{b}/{q}' for b, q in fx_pairs)}  (and inverses)",
             f"   Source : {ECB_SOURCE['source_name']}",
             f"   URL    : {ECB_SOURCE['source_url']}",
             f"   Method : the Excel sheet holds only the daily (business-day) series.",
@@ -590,15 +597,21 @@ def generate_stata_do(
             "* ---- Daily (base series, imported from Excel) ----",
             f'import excel using "`excel\'", sheet("ECB - FX - Daily") cellrange(A2) clear',
             "rename A date_str",
-            f"rename B {fwd_var}",
-            f"rename C {inv_var}",
+        ]
+        for i, (fwd_var, inv_var, fwd_col, inv_col) in enumerate(var_pairs):
+            L.append(f"rename {col_letter(2 + 2 * i)} {fwd_var}")
+            L.append(f"rename {col_letter(3 + 2 * i)} {inv_var}")
+        L += [
             'gen date_daily = date(date_str, "YMD")',
             "format date_daily %td",
             "drop date_str",
             'label variable date_daily "Date"',
-            f'label variable {fwd_var} "{fwd_col} — ECB reference rate"',
-            f'label variable {inv_var} "{inv_col} — ECB reference rate"',
-            f"order date_daily {fwd_var} {inv_var}",
+        ]
+        for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
+            L.append(f'label variable {fwd_var} "{fwd_col} — ECB reference rate"')
+            L.append(f'label variable {inv_var} "{inv_col} — ECB reference rate"')
+        L += [
+            f"order date_daily {' '.join(all_vars)}",
             "sort date_daily",
             "tsset date_daily",
             'save "ecb_fx_daily.dta", replace',
@@ -613,61 +626,46 @@ def generate_stata_do(
                 "gen week_start = date_daily - mod(dow + 6, 7)   // Monday of that week",
                 "format week_start %td",
                 "drop dow",
-                f"collapse (mean) {fwd_var} {inv_var}, by(week_start)",
+                f"collapse (mean) {' '.join(all_vars)}, by(week_start)",
                 "gen week_end = week_start + 4",
                 "format week_end %td",
                 'label variable week_start "Week start (Monday)"',
                 'label variable week_end   "Week end (Friday)"',
-                f'label variable {fwd_var} "{fwd_col} — average of daily rates in the week"',
-                f'label variable {inv_var} "{inv_col} — average of daily rates in the week"',
-                f"order week_start week_end {fwd_var} {inv_var}",
+            ]
+            for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
+                L.append(f'label variable {fwd_var} "{fwd_col} — average of daily rates in the week"')
+                L.append(f'label variable {inv_var} "{inv_col} — average of daily rates in the week"')
+            L += [
+                f"order week_start week_end {' '.join(all_vars)}",
                 "tsset week_start",
                 'save "ecb_fx_weekly.dta", replace',
                 "",
             ]
 
-        if "Monthly" in fx_frequencies:
+        # Monthly / Quarterly / Annual share the same shape: convert date_daily to
+        # the period with Stata's built-in function, collapse, save.
+        period_specs = [
+            ("Monthly",   "month",   "mofd(date_daily)", "%tm", "month",    "Month",    "ecb_fx_monthly.dta"),
+            ("Quarterly", "quarter", "qofd(date_daily)", "%tq", "quarter",  "Quarter",  "ecb_fx_quarterly.dta"),
+            ("Annual",    "year",    "yofd(date_daily)", "%ty", "year",     "Year",     "ecb_fx_annual.dta"),
+        ]
+        for freq_name, group_var, gen_expr, fmt, period_word, period_label, dta_name in period_specs:
+            if freq_name not in fx_frequencies:
+                continue
             L += [
-                "* ---- Monthly (average of the daily rate) ----",
+                f"* ---- {freq_name} (average of the daily rate) ----",
                 'use "ecb_fx_daily.dta", clear',
-                "gen month = mofd(date_daily)",
-                "format month %tm",
-                f"collapse (mean) {fwd_var} {inv_var}, by(month)",
-                'label variable month "Month"',
-                f'label variable {fwd_var} "{fwd_col} — average of daily rates in the month"',
-                f'label variable {inv_var} "{inv_col} — average of daily rates in the month"',
-                "tsset month",
-                'save "ecb_fx_monthly.dta", replace',
-                "",
+                f"gen {group_var} = {gen_expr}",
+                f"format {group_var} {fmt}",
+                f"collapse (mean) {' '.join(all_vars)}, by({group_var})",
+                f'label variable {group_var} "{period_label}"',
             ]
-
-        if "Quarterly" in fx_frequencies:
+            for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
+                L.append(f'label variable {fwd_var} "{fwd_col} — average of daily rates in the {period_word}"')
+                L.append(f'label variable {inv_var} "{inv_col} — average of daily rates in the {period_word}"')
             L += [
-                "* ---- Quarterly (average of the daily rate) ----",
-                'use "ecb_fx_daily.dta", clear',
-                "gen quarter = qofd(date_daily)",
-                "format quarter %tq",
-                f"collapse (mean) {fwd_var} {inv_var}, by(quarter)",
-                'label variable quarter "Quarter"',
-                f'label variable {fwd_var} "{fwd_col} — average of daily rates in the quarter"',
-                f'label variable {inv_var} "{inv_col} — average of daily rates in the quarter"',
-                "tsset quarter",
-                'save "ecb_fx_quarterly.dta", replace',
-                "",
-            ]
-
-        if "Annual" in fx_frequencies:
-            L += [
-                "* ---- Annual (average of the daily rate) ----",
-                'use "ecb_fx_daily.dta", clear',
-                "gen year = yofd(date_daily)",
-                "format year %ty",
-                f"collapse (mean) {fwd_var} {inv_var}, by(year)",
-                'label variable year "Year"',
-                f'label variable {fwd_var} "{fwd_col} — average of daily rates in the year"',
-                f'label variable {inv_var} "{inv_col} — average of daily rates in the year"',
-                "tsset year",
-                'save "ecb_fx_annual.dta", replace',
+                f"tsset {group_var}",
+                f'save "{dta_name}", replace',
                 "",
             ]
 
@@ -755,7 +753,7 @@ st.markdown("""
 with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
     include_fx = st.checkbox("Include exchange rate data", value=True)
 
-    fx_base  = "USD"
+    fx_bases: list[str] = []
     fx_quote = "EUR"
     fx_frequencies: list[str] = []
 
@@ -768,41 +766,37 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
         if fx_start > fx_end:
             st.error("Start date must be before end date.")
 
-        st.markdown("**Select your currency pair**")
-        p1, p2 = st.columns(2)
-        with p1:
-            base_raw = st.selectbox(
-                "🏦 I have (base currency)",
-                options=CURRENCY_OPTIONS,
-                index=CURRENCY_OPTIONS.index("USD — US Dollar"),
-                key="fx_base",
-                help="The currency you are converting FROM. E.g. if you want to know how many EUR one USD buys, select USD here.",
-            )
-        with p2:
-            quote_raw = st.selectbox(
-                "💰 I want (quote currency)",
-                options=CURRENCY_OPTIONS,
-                index=CURRENCY_OPTIONS.index("EUR — Euro"),
-                key="fx_quote",
-                help="The currency you are converting TO. The rate tells you how many units of this currency one unit of the base buys.",
-            )
-
-        fx_base  = base_raw.split(" — ")[0]
+        st.markdown("**Select your currencies**")
+        quote_raw = st.selectbox(
+            "💰 I want (common quote currency)",
+            options=CURRENCY_OPTIONS,
+            index=CURRENCY_OPTIONS.index("EUR — Euro"),
+            key="fx_quote",
+            help="The currency every pair converts TO. Every base currency below is paired against this one.",
+        )
         fx_quote = quote_raw.split(" — ")[0]
 
-        if fx_base == fx_quote:
-            st.error("Base and quote currencies must be different.")
+        base_options  = [opt for opt in CURRENCY_OPTIONS if opt.split(" — ")[0] != fx_quote]
+        default_bases = [o for o in DEFAULT_BASE_CURRENCIES if o in base_options]
+        bases_raw = st.multiselect(
+            "🏦 I have (one or more base currencies)",
+            options=base_options,
+            default=default_bases,
+            key="fx_bases",
+            help="Each one becomes a pair against the quote currency above, e.g. USD/EUR, GBP/EUR.",
+        )
+        fx_bases = [b.split(" — ")[0] for b in bases_raw]
+
+        if not fx_bases:
+            st.info("Select at least one base currency.")
         else:
-            fwd = f"{fx_base}/{fx_quote}"
-            inv = f"{fx_quote}/{fx_base}"
-            base_name  = CURRENCY_CATALOGUE[fx_base]
+            pair_list  = ", ".join(f"{b}/{fx_quote}" for b in fx_bases)
             quote_name = CURRENCY_CATALOGUE[fx_quote]
             st.markdown(
                 f'<div class="info-banner">'
-                f'✔ <strong>{fwd}</strong> — how many <strong>{fx_quote} ({quote_name})</strong> '
-                f'you get for 1 <strong>{fx_base} ({base_name})</strong>'
-                f'<br>The inverse <strong>{inv}</strong> will also be included in every sheet.'
-                f'<br><small>Source: ECB Statistical Data Warehouse. Cross rates derived via EUR where needed.</small>'
+                f'✔ <strong>{pair_list}</strong> — and their inverses — will be included, '
+                f'all against <strong>{fx_quote} ({quote_name})</strong>.'
+                f'<br><small>Source: ECB Statistical Data Warehouse. One API call covers every pair above.</small>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
@@ -818,6 +812,17 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
                 "Each one you pick is a simple average of the daily rate over the period, "
                 "computed directly in the generated .do file so the calculation stays fully visible."
             )
+
+            span_days = (fx_end - fx_start).days
+            MIN_DAYS_FOR_FREQ = {"Weekly": 7, "Monthly": 31, "Quarterly": 93, "Annual": 366}
+            too_short = [f for f in fx_frequencies if span_days < MIN_DAYS_FOR_FREQ[f]]
+            if too_short:
+                st.markdown(
+                    f'<div class="warn-banner">⚠ Your date range covers only {span_days} day(s) — '
+                    f'shorter than a full period for <strong>{", ".join(too_short)}</strong>. '
+                    f'Those tables will likely end up with just one partial row.</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ── SECTION 2 — World Bank ────────────────────────────────────────────────────
@@ -935,7 +940,7 @@ with st.expander("🏦  World Bank Indicators", expanded=False):
 
 
 # ── GENERATE ──────────────────────────────────────────────────────────────────
-fx_ready = include_fx and (fx_base != fx_quote)
+fx_ready = include_fx and len(fx_bases) > 0
 nothing_selected = (not fx_ready) and (not include_wb or not selected_indicators)
 
 if nothing_selected:
@@ -948,8 +953,8 @@ else:
             if fx_start > fx_end:
                 st.error("Fix the FX date range first.")
                 all_ok = False
-            if fx_base == fx_quote:
-                st.error("Base and quote currencies must be different.")
+            if not fx_bases:
+                st.error("Select at least one base currency for the exchange rate data.")
                 all_ok = False
         if include_wb and wb_start_year > wb_end_year:
             st.error("'From year' must be ≤ 'To year'.")
@@ -965,18 +970,18 @@ else:
 
             # ── FX ────────────────────────────────────────────────────────
             if fx_ready:
-                fwd_label = f"{fx_base}/{fx_quote}"
-                progress.progress(0, text=f"Fetching {fwd_label} data from ECB…")
+                pair_label = ", ".join(f"{b}/{fx_quote}" for b in fx_bases)
+                progress.progress(0, text=f"Fetching {pair_label} data from ECB…")
                 try:
-                    build_fx_daily_sheet(wb_excel, fx_base, fx_quote, fx_start, fx_end)
+                    build_fx_daily_sheet(wb_excel, fx_bases, fx_quote, fx_start, fx_end)
                     first_added = True
                     sheet_registry.append({
                         "sheet_name":  "ECB - FX - Daily",
-                        "dataset":     f"{fwd_label} Exchange Rate — Daily (business days)",
+                        "dataset":     f"Daily FX rates — {pair_label} (business days)",
                         **ECB_SOURCE,
                     })
                     step += 1
-                    progress.progress(step / total_steps, text=f"{fwd_label} data loaded ✓")
+                    progress.progress(step / total_steps, text=f"{pair_label} data loaded ✓")
                 except Exception as e:
                     st.error(f"Error fetching FX data: {e}")
                     all_ok = False
@@ -1035,14 +1040,14 @@ else:
 
                 fname_parts = []
                 if fx_ready:
-                    fname_parts.append(f"FX_{fx_base}_{fx_quote}_{fx_start}_to_{fx_end}")
+                    fname_parts.append(f"FX_{'-'.join(fx_bases)}_vs_{fx_quote}_{fx_start}_to_{fx_end}")
                 if include_wb and selected_indicators:
                     fname_parts.append(f"WB_{int(wb_start_year)}-{int(wb_end_year)}")
                 excel_filename = "_".join(fname_parts) + ".xlsx"
 
                 do_content  = generate_stata_do(
                     sheet_registry, excel_filename, today_str,
-                    (fx_base, fx_quote) if fx_ready else None,
+                    [(b, fx_quote) for b in fx_bases] if fx_ready else [],
                     fx_frequencies if fx_ready else [],
                 )
                 do_filename = f"Import - Ancillary data - {today_str}.do"
