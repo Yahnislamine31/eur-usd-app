@@ -316,8 +316,8 @@ def fetch_ecb_vs_eur(
 def build_fx_daily_sheet(wb: Workbook, bases: list[str], quote: str, start_date, end_date):
     """
     Build the single "ECB - FX - Daily" sheet, covering every (base, quote) pair
-    at once via ONE ECB API call. Columns: Date, then BASE/QUOTE, QUOTE/BASE for
-    each base currency selected — e.g. Date, USD/EUR, EUR/USD, GBP/EUR, EUR/GBP.
+    at once via ONE ECB API call. Columns: Date, then one BASE/QUOTE column for
+    each base currency selected — e.g. Date, USD/EUR, GBP/EUR.
 
     This is the ONLY FX sheet the Excel file contains. Weekly/Monthly/Quarterly/Annual
     figures are not pre-computed here — the generated Stata .do file derives them from
@@ -336,11 +336,9 @@ def build_fx_daily_sheet(wb: Workbook, bases: list[str], quote: str, start_date,
     pairs = pd.DataFrame(index=wide.index)
     for base in bases:
         fwd_col = f"{base}/{quote}"       # e.g. USD/EUR
-        inv_col = f"{quote}/{base}"       # e.g. EUR/USD
         b = wide[base].values              # numpy array — no ambiguity
         q = wide[quote].values
         pairs[fwd_col] = pd.Series(q / b, index=wide.index).apply(precise_round)
-        pairs[inv_col] = pd.Series(b / q, index=wide.index).apply(precise_round)
 
     ws = wb.active
     ws.title = "ECB - FX - Daily"
@@ -574,18 +572,17 @@ def generate_stata_do(
 
     # ── Section 1: FX ────────────────────────────────────────────────────────
     if fx_pairs:
-        # var_pairs: (fwd_var, inv_var, fwd_col, inv_col) per pair, in sheet column order
+        # var_pairs: (var, col_label) per pair, in sheet column order — e.g. ("usd_eur", "USD/EUR")
         var_pairs = [
-            (f"{base.lower()}_{quote.lower()}", f"{quote.lower()}_{base.lower()}",
-             f"{base}/{quote}", f"{quote}/{base}")
+            (f"{base.lower()}_{quote.lower()}", f"{base}/{quote}")
             for base, quote in fx_pairs
         ]
-        all_vars = [v for pair in var_pairs for v in pair[:2]]  # fwd_var, inv_var, per pair
+        all_vars = [var for var, _ in var_pairs]
 
         L += [
             f"/* {dash}",
             f"   SECTION 1 — ECB Exchange Rates",
-            f"   Pairs  : {', '.join(f'{b}/{q}' for b, q in fx_pairs)}  (and inverses)",
+            f"   Pairs  : {', '.join(f'{b}/{q}' for b, q in fx_pairs)}",
             f"   Source : {ECB_SOURCE['source_name']}",
             f"   URL    : {ECB_SOURCE['source_url']}",
             f"   Method : the Excel sheet holds only the daily (business-day) series.",
@@ -598,18 +595,16 @@ def generate_stata_do(
             f'import excel using "`excel\'", sheet("ECB - FX - Daily") cellrange(A2) clear',
             "rename A date_str",
         ]
-        for i, (fwd_var, inv_var, fwd_col, inv_col) in enumerate(var_pairs):
-            L.append(f"rename {col_letter(2 + 2 * i)} {fwd_var}")
-            L.append(f"rename {col_letter(3 + 2 * i)} {inv_var}")
+        for i, (var, col) in enumerate(var_pairs):
+            L.append(f"rename {col_letter(2 + i)} {var}")
         L += [
             'gen date_daily = date(date_str, "YMD")',
             "format date_daily %td",
             "drop date_str",
             'label variable date_daily "Date"',
         ]
-        for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
-            L.append(f'label variable {fwd_var} "{fwd_col} — ECB reference rate"')
-            L.append(f'label variable {inv_var} "{inv_col} — ECB reference rate"')
+        for var, col in var_pairs:
+            L.append(f'label variable {var} "{col} — ECB reference rate"')
         L += [
             f"order date_daily {' '.join(all_vars)}",
             "sort date_daily",
@@ -632,9 +627,8 @@ def generate_stata_do(
                 'label variable week_start "Week start (Monday)"',
                 'label variable week_end   "Week end (Friday)"',
             ]
-            for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
-                L.append(f'label variable {fwd_var} "{fwd_col} — average of daily rates in the week"')
-                L.append(f'label variable {inv_var} "{inv_col} — average of daily rates in the week"')
+            for var, col in var_pairs:
+                L.append(f'label variable {var} "{col} — average of daily rates in the week"')
             L += [
                 f"order week_start week_end {' '.join(all_vars)}",
                 "tsset week_start",
@@ -660,9 +654,8 @@ def generate_stata_do(
                 f"collapse (mean) {' '.join(all_vars)}, by({group_var})",
                 f'label variable {group_var} "{period_label}"',
             ]
-            for fwd_var, inv_var, fwd_col, inv_col in var_pairs:
-                L.append(f'label variable {fwd_var} "{fwd_col} — average of daily rates in the {period_word}"')
-                L.append(f'label variable {inv_var} "{inv_col} — average of daily rates in the {period_word}"')
+            for var, col in var_pairs:
+                L.append(f'label variable {var} "{col} — average of daily rates in the {period_word}"')
             L += [
                 f"tsset {group_var}",
                 f'save "{dta_name}", replace',
@@ -794,7 +787,7 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
             quote_name = CURRENCY_CATALOGUE[fx_quote]
             st.markdown(
                 f'<div class="info-banner">'
-                f'✔ <strong>{pair_list}</strong> — and their inverses — will be included, '
+                f'✔ <strong>{pair_list}</strong> will be included, '
                 f'all against <strong>{fx_quote} ({quote_name})</strong>.'
                 f'<br><small>Source: ECB Statistical Data Warehouse. The ECB only publishes rates against EUR, '
                 f'so any pair where neither side is EUR (e.g. JPY vs CHF) is derived automatically by cross-dividing '
