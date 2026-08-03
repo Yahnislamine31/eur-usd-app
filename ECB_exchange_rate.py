@@ -7,6 +7,8 @@ from openpyxl.styles import Font, PatternFill, Alignment
 import tempfile
 import time
 import zipfile
+import calendar
+from datetime import date as _date, timedelta as _timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -265,6 +267,67 @@ def col_letter(n: int) -> str:
         n, rem = divmod(n - 1, 26)
         result = chr(65 + rem) + result
     return result
+
+
+# ── DATE / PERIOD HELPERS ─────────────────────────────────────────────────────
+TODAY        = pd.Timestamp.today().date()
+CURRENT_YEAR = TODAY.year
+MONTH_NAMES  = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"]
+
+
+def _month_end(year: int, month: int) -> _date:
+    return _date(year, month, calendar.monthrange(year, month)[1])
+
+
+def _quarter_bounds(year: int, quarter: int) -> tuple[_date, _date]:
+    start_month = 3 * (quarter - 1) + 1
+    return _date(year, start_month, 1), _month_end(year, start_month + 2)
+
+
+def _period_bounds(freq: str, d: _date) -> tuple[_date, _date]:
+    """Calendar start/end of the <freq> period that contains date d."""
+    if freq == "Annual":
+        return _date(d.year, 1, 1), _date(d.year, 12, 31)
+    if freq == "Quarterly":
+        return _quarter_bounds(d.year, (d.month - 1) // 3 + 1)
+    if freq == "Monthly":
+        return _date(d.year, d.month, 1), _month_end(d.year, d.month)
+    if freq == "Weekly":
+        week_start = d - _timedelta(days=d.weekday())  # Monday
+        return week_start, week_start + _timedelta(days=4)  # Friday
+    return d, d
+
+
+def _period_label(freq: str, d: _date) -> str:
+    if freq == "Annual":
+        return str(d.year)
+    if freq == "Quarterly":
+        return f"Q{(d.month - 1) // 3 + 1} {d.year}"
+    if freq == "Monthly":
+        return f"{MONTH_NAMES[d.month - 1]} {d.year}"
+    if freq == "Weekly":
+        week_start = d - _timedelta(days=d.weekday())
+        return f"week of {week_start:%Y-%m-%d}"
+    return d.strftime("%Y-%m-%d")
+
+
+def incomplete_period_note(freq: str, start: _date, end: _date) -> str | None:
+    """
+    Human-readable note if the first or last <freq> period touched by [start, end]
+    isn't fully covered — e.g. Annual over Jan 2022 - Jun 2023 flags 2023 as partial.
+    Returns None if both boundary periods are complete.
+    """
+    first_start, _ = _period_bounds(freq, start)
+    _, last_end    = _period_bounds(freq, end)
+    bits = []
+    if start > first_start:
+        bits.append(f"{_period_label(freq, start)} only starts {start:%Y-%m-%d}")
+    if end < last_end:
+        bits.append(f"{_period_label(freq, end)} only runs through {end:%Y-%m-%d}")
+    if not bits:
+        return None
+    return f"<strong>{freq}</strong> — " + "; ".join(bits)
 
 
 # ── ECB FETCHER ───────────────────────────────────────────────────────────────
@@ -535,7 +598,7 @@ def generate_stata_do(
     fx_dta_files: list[str] = []
     if fx_pairs:
         fx_dta_files.append("ecb_fx_daily.dta")
-        fx_dta_files += [f"ecb_fx_{freq.lower()}.dta" for freq in fx_frequencies]
+        fx_dta_files += [f"ecb_fx_{freq.lower()}.dta" for freq in fx_frequencies if freq != "Daily"]
 
     # ── Header ───────────────────────────────────────────────────────────────
     L += [
@@ -749,16 +812,10 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
     fx_bases: list[str] = []
     fx_quote = "EUR"
     fx_frequencies: list[str] = []
+    fx_start = _date(2015, 1, 1)
+    fx_end   = TODAY
 
     if include_fx:
-        c1, c2 = st.columns(2)
-        with c1:
-            fx_start = st.date_input("Start date (YYYY-MM-DD)", pd.to_datetime("2015-01-01"), key="fx_start")
-        with c2:
-            fx_end = st.date_input("End date (YYYY-MM-DD)", pd.to_datetime("today"), key="fx_end")
-        if fx_start > fx_end:
-            st.error("Start date must be before end date.")
-
         st.markdown("**Select your currencies**")
         quote_raw = st.selectbox(
             "💰 I want (common quote currency)",
@@ -795,10 +852,11 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
                 f'</div>',
                 unsafe_allow_html=True,
             )
+
             st.markdown("**Frequencies to compute (in Stata)**")
             fx_frequencies = st.multiselect(
                 "The Excel (input) file only ever holds the raw daily series",
-                options=["Weekly", "Monthly", "Quarterly", "Annual"],
+                options=["Daily", "Weekly", "Monthly", "Quarterly", "Annual"],
                 default=["Monthly"],
                 placeholder="— none selected (daily only) —",
                 key="fx_frequencies",
@@ -808,14 +866,94 @@ with st.expander("💱  Exchange Rates  (ECB)", expanded=True):
                 "computed directly in the generated .do file."
             )
 
-            span_days = (fx_end - fx_start).days
-            MIN_DAYS_FOR_FREQ = {"Weekly": 5, "Monthly": 27, "Quarterly": 89, "Annual": 365}
-            too_short = [f for f in fx_frequencies if span_days < MIN_DAYS_FOR_FREQ[f]]
-            if too_short:
+            # The date-range picker adapts to the coarsest frequency picked, so a
+            # complete period is selected by construction. "Daily" (or nothing
+            # coarser than Weekly) falls back to picking exact calendar dates.
+            freqs = set(fx_frequencies)
+            if "Daily" in freqs:
+                granularity = "day"
+            elif "Annual" in freqs:
+                granularity = "year"
+            elif "Quarterly" in freqs:
+                granularity = "quarter"
+            elif "Monthly" in freqs:
+                granularity = "month"
+            else:
+                granularity = "day"
+
+            st.markdown("**Date range**")
+
+            if granularity == "year":
+                y1, y2 = st.columns(2)
+                with y1:
+                    start_year = st.number_input("Start year", min_value=1999, max_value=CURRENT_YEAR, value=2015, step=1, key="fx_start_year")
+                with y2:
+                    end_year = st.number_input("End year", min_value=1999, max_value=CURRENT_YEAR, value=CURRENT_YEAR, step=1, key="fx_end_year")
+                fx_start = _date(int(start_year), 1, 1)
+                fx_end   = min(_date(int(end_year), 12, 31), TODAY)
+                st.caption("Every month of each selected year is included automatically.")
+
+            elif granularity == "quarter":
+                y1, q1, y2, q2 = st.columns(4)
+                with y1:
+                    start_year = st.number_input("Start year", min_value=1999, max_value=CURRENT_YEAR, value=2015, step=1, key="fx_start_year")
+                with q1:
+                    start_q = st.selectbox("Start quarter", ["Q1", "Q2", "Q3", "Q4"], index=0, key="fx_start_q")
+                with y2:
+                    end_year = st.number_input("End year", min_value=1999, max_value=CURRENT_YEAR, value=CURRENT_YEAR, step=1, key="fx_end_year")
+                with q2:
+                    end_q = st.selectbox("End quarter", ["Q1", "Q2", "Q3", "Q4"], index=(TODAY.month - 1) // 3, key="fx_end_q")
+                fx_start, _        = _quarter_bounds(int(start_year), int(start_q[1]))
+                _, quarter_end_max = _quarter_bounds(int(end_year), int(end_q[1]))
+                fx_end = min(quarter_end_max, TODAY)
+                st.caption("Every month of each selected quarter is included automatically.")
+
+            elif granularity == "month":
+                y1, m1, y2, m2 = st.columns(4)
+                with y1:
+                    start_year = st.number_input("Start year", min_value=1999, max_value=CURRENT_YEAR, value=2015, step=1, key="fx_start_year")
+                with m1:
+                    start_month = st.selectbox("Start month", MONTH_NAMES, index=0, key="fx_start_month")
+                with y2:
+                    end_year = st.number_input("End year", min_value=1999, max_value=CURRENT_YEAR, value=CURRENT_YEAR, step=1, key="fx_end_year")
+                with m2:
+                    end_month = st.selectbox("End month", MONTH_NAMES, index=TODAY.month - 1, key="fx_end_month")
+                fx_start = _date(int(start_year), MONTH_NAMES.index(start_month) + 1, 1)
+                fx_end   = min(_month_end(int(end_year), MONTH_NAMES.index(end_month) + 1), TODAY)
+                st.caption("Every day of each selected month is included automatically.")
+
+            else:
+                def _set_end_today():
+                    st.session_state["fx_end"] = TODAY
+
+                c1, c2, c3 = st.columns([1, 1, 0.6])
+                with c1:
+                    fx_start = st.date_input(
+                        "Start date (YYYY-MM-DD)", pd.to_datetime("2015-01-01"),
+                        max_value=TODAY, key="fx_start",
+                    )
+                with c2:
+                    fx_end = st.date_input(
+                        "End date (YYYY-MM-DD)", pd.to_datetime("today"),
+                        max_value=TODAY, key="fx_end",
+                    )
+                with c3:
+                    st.markdown("<div style='height:1.85rem'></div>", unsafe_allow_html=True)
+                    st.button("Today", on_click=_set_end_today, key="btn_today_end", use_container_width=True)
+
+            if fx_start > fx_end:
+                st.error("Start date must be before end date.")
+
+            # Flag any selected frequency whose first/last period isn't fully covered
+            period_notes = [
+                incomplete_period_note(freq, fx_start, fx_end)
+                for freq in fx_frequencies if freq != "Daily"
+            ]
+            period_notes = [n for n in period_notes if n]
+            if period_notes:
                 st.markdown(
-                    f'<div class="warn-banner">⚠ Your date range covers only {span_days} day(s) — '
-                    f'shorter than a full period for <strong>{", ".join(too_short)}</strong>. '
-                    f'Those tables will likely end up with just one partial row.</div>',
+                    f'<div class="warn-banner">⚠ Partial period(s) with this range:<br>'
+                    + "<br>".join(period_notes) + "</div>",
                     unsafe_allow_html=True,
                 )
 
